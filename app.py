@@ -210,9 +210,9 @@ class OpenAIProvider:
 
 
 PROVIDERS = {
-    "Ollama (local)": OllamaProvider(),
     "Anthropic Claude": AnthropicProvider(),
     "OpenAI": OpenAIProvider(),
+    "Ollama (local)": OllamaProvider(),
 }
 
 ENV_KEY_NAMES = {
