@@ -87,6 +87,23 @@ def fetch_paper_text(url: str) -> tuple[str, str]:
 # --- Providers ----------------------------------------------------------------
 
 
+class APIError(Exception):
+    pass
+
+
+def _raise_for_status(r, provider: str):
+    if r.ok:
+        return
+    try:
+        body = r.json()
+        err = body.get("error", body)
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        msg = msg or json.dumps(body)[:500]
+    except (ValueError, json.JSONDecodeError):
+        msg = r.text[:500] or r.reason
+    raise APIError(f"{provider} {r.status_code}: {msg}")
+
+
 class OllamaProvider:
     name = "Ollama (local)"
     needs_key = False
@@ -108,7 +125,7 @@ class OllamaProvider:
         with requests.post(
             f"{OLLAMA_BASE}/api/chat", json=payload, stream=True, timeout=600
         ) as r:
-            r.raise_for_status()
+            _raise_for_status(r, "Ollama")
             for line in r.iter_lines():
                 if not line:
                     continue
@@ -124,12 +141,27 @@ class AnthropicProvider:
     name = "Anthropic Claude"
     needs_key = True
 
-    def list_models(self, _key=None):
-        return [
-            "claude-opus-4-7",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5-20251001",
-        ]
+    def list_models(self, key=None):
+        if not key:
+            return [
+                "claude-opus-4-5",
+                "claude-sonnet-4-5",
+                "claude-haiku-4-5",
+            ]
+        try:
+            r = requests.get(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            return [m["id"] for m in r.json().get("data", [])]
+        except requests.RequestException:
+            return [
+                "claude-opus-4-5",
+                "claude-sonnet-4-5",
+                "claude-haiku-4-5",
+            ]
 
     def stream_chat(self, model, system, messages, key):
         headers = {
@@ -151,7 +183,7 @@ class AnthropicProvider:
             stream=True,
             timeout=600,
         ) as r:
-            r.raise_for_status()
+            _raise_for_status(r, "Anthropic")
             for line in r.iter_lines():
                 if not line or not line.startswith(b"data: "):
                     continue
@@ -172,8 +204,25 @@ class OpenAIProvider:
     name = "OpenAI"
     needs_key = True
 
-    def list_models(self, _key=None):
-        return ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
+    def list_models(self, key=None):
+        fallback = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
+        if not key:
+            return fallback
+        try:
+            r = requests.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            ids = [m["id"] for m in r.json().get("data", [])]
+            chat = sorted(
+                [i for i in ids if any(p in i for p in ("gpt-4", "gpt-5", "o1", "o3"))],
+                reverse=True,
+            )
+            return chat or fallback
+        except requests.RequestException:
+            return fallback
 
     def stream_chat(self, model, system, messages, key):
         headers = {
@@ -192,7 +241,7 @@ class OpenAIProvider:
             stream=True,
             timeout=600,
         ) as r:
-            r.raise_for_status()
+            _raise_for_status(r, "OpenAI")
             for line in r.iter_lines():
                 if not line or not line.startswith(b"data: "):
                     continue
@@ -382,7 +431,11 @@ with st.sidebar:
             key=f"key_{provider_name}",
         )
 
-    models = provider.list_models(api_key)
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _cached_models(pname: str, key: str) -> list[str]:
+        return PROVIDERS[pname].list_models(key or None)
+
+    models = _cached_models(provider_name, api_key or "")
     if not models:
         if isinstance(provider, OllamaProvider):
             st.error(
@@ -530,8 +583,8 @@ with tab_summary:
                     placeholder.markdown(output)
                 st.session_state.summary = output
                 st.session_state.summary_elapsed = time.time() - start
-            except requests.RequestException as e:
-                st.error(f"Summarization failed: {e}")
+            except (requests.RequestException, APIError) as e:
+                st.error(f"Summarization failed — {e}")
 
         if st.session_state.summary:
             if not generate:
@@ -581,8 +634,8 @@ with tab_ask:
                         placeholder.markdown(output + "▍")
                     placeholder.markdown(output)
                     st.session_state.messages.append({"role": "assistant", "content": output})
-                except requests.RequestException as e:
-                    st.error(f"Chat failed: {e}")
+                except (requests.RequestException, APIError) as e:
+                    st.error(f"Chat failed — {e}")
 
         if st.session_state.messages:
             if st.button("🗑 Clear conversation"):
